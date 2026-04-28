@@ -1,5 +1,10 @@
-use nih_plug::prelude::*;
+use nih_plug::{prelude::*};
 use std::sync::Arc;
+use nih_plug_egui::{create_egui_editor, 
+    egui::{self, Vec2}, 
+    resizable_window::ResizableWindow,
+    widgets, EguiState
+};
 
 // This is a shortened version of the gain example with most comments removed, check out
 // https://github.com/robbert-vdh/nih-plug/blob/master/plugins/examples/gain/src/lib.rs to get
@@ -26,6 +31,10 @@ struct DelayPluginParams {
     pub feedback: FloatParam,
     #[id = "mix"]
     pub mix: FloatParam,
+
+    // egui editor state
+    # [persist = "editor-state"]
+    editor_state: Arc<EguiState>,
 }
 
 impl Default for DelayPlugin {
@@ -77,6 +86,8 @@ impl Default for DelayPluginParams {
             )
             .with_smoother(SmoothingStyle::Linear(10.0))
             .with_value_to_string(formatters::v2s_f32_percentage(1)),
+
+            editor_state: EguiState::from_size(300, 180),
         }
     }
 }
@@ -120,6 +131,16 @@ impl Plugin for DelayPlugin {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let editor_state = params.editor_state.clone();
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            (),
+            |_, _| {},
+        )
     }
 
     fn initialize(
