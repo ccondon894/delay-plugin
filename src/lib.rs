@@ -1,10 +1,11 @@
-use nih_plug::{prelude::*};
-use std::sync::Arc;
-use nih_plug_egui::{create_egui_editor, 
-    egui::{self, Vec2}, 
+use nih_plug::prelude::*;
+use nih_plug_egui::{
+    create_egui_editor,
+    egui::{self, Vec2},
     resizable_window::ResizableWindow,
-    widgets, EguiState
+    widgets, EguiState,
 };
+use std::sync::Arc;
 
 // This is a shortened version of the gain example with most comments removed, check out
 // https://github.com/robbert-vdh/nih-plug/blob/master/plugins/examples/gain/src/lib.rs to get
@@ -33,8 +34,8 @@ struct DelayPluginParams {
     pub mix: FloatParam,
 
     // egui editor state
-    # [persist = "editor-state"]
-    editor_state: Arc<EguiState>,
+    #[persist = "editor-state"]
+    egui_state: Arc<EguiState>,
 }
 
 impl Default for DelayPlugin {
@@ -58,36 +59,29 @@ impl Default for DelayPluginParams {
                 FloatRange::Skewed {
                     min: 0.001,
                     max: MAX_DELAY_TIME,
-                    factor: FloatRange::skew_factor(-1.0)
-                }, 
+                    factor: FloatRange::skew_factor(-1.0),
+                },
             )
             .with_unit(" ms")
             .with_smoother(SmoothingStyle::Logarithmic(50.0))
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
-            
+
             feedback: FloatParam::new(
                 "Feedback",
                 0.5,
                 FloatRange::Linear {
                     min: 0.0,
-                    max:0.98 // so we don't go into self-oscillation
-                },
-            )
-            .with_smoother(SmoothingStyle::Linear(10.0))
-            .with_value_to_string(formatters::v2s_f32_percentage(1)),
-            
-            mix: FloatParam::new(
-                "Mix",
-                0.5,
-                FloatRange::Linear {
-                    min: 0.0,
-                    max: 1.0,
+                    max: 0.98, // so we don't go into self-oscillation
                 },
             )
             .with_smoother(SmoothingStyle::Linear(10.0))
             .with_value_to_string(formatters::v2s_f32_percentage(1)),
 
-            editor_state: EguiState::from_size(300, 180),
+            mix: FloatParam::new("Mix", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(10.0))
+                .with_value_to_string(formatters::v2s_f32_percentage(1)),
+
+            egui_state: EguiState::from_size(300, 180),
         }
     }
 }
@@ -135,11 +129,20 @@ impl Plugin for DelayPlugin {
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
-        let editor_state = params.editor_state.clone();
+        let egui_state = params.egui_state.clone();
         create_egui_editor(
-            self.params.editor_state.clone(),
-            (),
-            |_, _| {},
+            self.params.egui_state.clone(), // egui state
+            (),                             // user state
+            |_, _| {},                      // build closure
+            move |egui_ctx, setter, _state| {
+                //update closure
+                ResizableWindow::new("res-wind")
+                    .min_size(Vec2::new(128.0, 128.0))
+                    .show(egui_ctx, egui_state.as_ref(), |ui| {
+                        ui.label("Delay Time");
+                        ui.add(widgets::ParamSlider::for_param(&params.delay_time, setter));
+                    });
+            },
         )
     }
 
@@ -147,7 +150,7 @@ impl Plugin for DelayPlugin {
         &mut self,
         audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>, 
+        _context: &mut impl InitContext<Self>,
     ) -> bool {
         // Resize buffers and perform other potentially expensive initialization operations here.
         // The `reset()` function is always called right after this function. You can remove this
@@ -168,7 +171,7 @@ impl Plugin for DelayPlugin {
     fn reset(&mut self) {
         // Reset delay buffers and write index to 0
         // remember to never allocate in the audio thread. This would be a heap
-        // operation and can block the audio thread, causing glitches/pops. 
+        // operation and can block the audio thread, causing glitches/pops.
         for buf in &mut self.delay_buffers {
             buf.fill(0.0);
         }
@@ -182,7 +185,7 @@ impl Plugin for DelayPlugin {
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let buf_len = self.delay_buffers[0].len(); // get the buffer length from initialization
-        
+
         for mut channel_samples in buffer.iter_samples() {
             // Read parameters with smoothing applied
             let delay_time = self.params.delay_time.smoothed.next();
@@ -190,13 +193,12 @@ impl Plugin for DelayPlugin {
             let mix = self.params.mix.smoothed.next();
             let delay_samples = (delay_time * self.sample_rate) as usize; // compute number of delay samples
             for (channel_idx, sample) in channel_samples.iter_mut().enumerate() {
-                
                 let delay_buffer = &mut self.delay_buffers[channel_idx]; //get delay buffer
                 let read_index = (self.write_index + buf_len - delay_samples) % buf_len; // get the read index
                 let delayed = delay_buffer[read_index]; //get the delayed buffer sample
-                let dry = *sample; // get the dry sample 
+                let dry = *sample; // get the dry sample
                 delay_buffer[self.write_index] = dry + feedback * delayed; // write the delayed + feedbacked signal to buffer
-                
+
                 *sample = (1.0 - mix) * dry + mix * delayed;
             }
             self.write_index = (self.write_index + 1) % buf_len;
