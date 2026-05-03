@@ -1,10 +1,10 @@
 use nih_plug::prelude::*;
 use nih_plug_egui::{
     create_egui_editor,
-    egui::{self, Vec2},
     resizable_window::ResizableWindow,
     widgets, EguiState,
 };
+use egui::{Vec2};
 use std::sync::Arc;
 
 // This is a shortened version of the gain example with most comments removed, check out
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 const MAX_DELAY_TIME: f32 = 2.0;
 
-struct DelayPlugin {
+pub struct DelayPlugin {
     params: Arc<DelayPluginParams>,
     delay_buffers: Vec<Vec<f32>>, // one Vec per channel
     write_index: usize,
@@ -132,15 +132,31 @@ impl Plugin for DelayPlugin {
         let egui_state = params.egui_state.clone();
         create_egui_editor(
             self.params.egui_state.clone(), // egui state
-            (),                             // user state
-            |_, _| {},                      // build closure
-            move |egui_ctx, setter, _state| {
+            (), // user state
+            Default::default(), // New Egui settings. Just use defaults
+            |_, _, _| {},                      // build closure (now takes 3 args)
+            move |egui_ctx, setter, _queue, _state| { // update closure now takes 4 args
                 //update closure
                 ResizableWindow::new("res-wind")
                     .min_size(Vec2::new(128.0, 128.0))
                     .show(egui_ctx, egui_state.as_ref(), |ui| {
                         ui.label("Delay Time");
-                        ui.add(widgets::ParamSlider::for_param(&params.delay_time, setter));
+                        ui.add(
+                            widgets::ParamSlider::for_param(&params.delay_time, setter)
+                                .with_width(ui.available_width())
+                        );
+
+                        ui.label("Feedback");
+                        ui.add(
+                            widgets::ParamSlider::for_param(&params.feedback, setter)
+                                .with_width(ui.available_width())
+                        );
+
+                        ui.label("Mix");
+                        ui.add(
+                            widgets::ParamSlider::for_param(&params.mix, setter)
+                                .with_width(ui.available_width())
+                        );
                     });
             },
         )
@@ -158,7 +174,7 @@ impl Plugin for DelayPlugin {
         self.sample_rate = buffer_config.sample_rate;
         let channel_count = audio_io_layout
             .main_input_channels
-            .expect("main input cahnnels must be set")
+            .expect("main input channels must be set")
             .get() as usize;
         // buffer sizing math: buffer size decides how much history the buffer needs to store
         // max delay is 2 seconds, and sample rate is samples per second.
