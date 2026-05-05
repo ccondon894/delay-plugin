@@ -4,8 +4,9 @@ use nih_plug_egui::{
     resizable_window::ResizableWindow,
     widgets, EguiState,
 };
-use egui::{Vec2};
+use egui::Vec2;
 use std::sync::Arc;
+use std::f32::consts::PI;
 
 // This is a shortened version of the gain example with most comments removed, check out
 // https://github.com/robbert-vdh/nih-plug/blob/master/plugins/examples/gain/src/lib.rs to get
@@ -13,11 +14,13 @@ use std::sync::Arc;
 
 const MAX_DELAY_TIME: f32 = 2.0;
 
+
 pub struct DelayPlugin {
     params: Arc<DelayPluginParams>,
     delay_buffers: Vec<Vec<f32>>, // one Vec per channel
     write_index: usize,
     sample_rate: f32,
+    prev_output: Vec<f32>
 }
 
 #[derive(Params)]
@@ -32,7 +35,8 @@ struct DelayPluginParams {
     pub feedback: FloatParam,
     #[id = "mix"]
     pub mix: FloatParam,
-
+    #[id = "cutoff"]
+    pub cutoff: FloatParam,
     // egui editor state
     #[persist = "editor-state"]
     egui_state: Arc<EguiState>,
@@ -45,6 +49,7 @@ impl Default for DelayPlugin {
             delay_buffers: Vec::new(),
             write_index: 0,
             sample_rate: 44100.0,
+            prev_output: Vec::new(),
         }
     }
 }
@@ -81,7 +86,21 @@ impl Default for DelayPluginParams {
                 .with_smoother(SmoothingStyle::Linear(10.0))
                 .with_value_to_string(formatters::v2s_f32_percentage(1)),
 
-            egui_state: EguiState::from_size(300, 180),
+            cutoff: FloatParam::new(
+                "Cutoff", 
+                5000.0, 
+                FloatRange::Skewed {
+                    min: 200.0, 
+                    max: 20000.0,
+                    factor: FloatRange::skew_factor(-1.0), 
+                }
+
+            )
+                .with_smoother(SmoothingStyle::Linear(10.0))
+                .with_value_to_string(formatters::v2s_f32_rounded(1))
+                .with_unit(" Hz"),
+
+            egui_state: EguiState::from_size(300, 220),
         }
     }
 }
@@ -138,7 +157,7 @@ impl Plugin for DelayPlugin {
             move |egui_ctx, setter, _queue, _state| { // update closure now takes 4 args
                 //update closure
                 ResizableWindow::new("res-wind")
-                    .min_size(Vec2::new(128.0, 128.0))
+                    .min_size(Vec2::new(300.0, 128.0))
                     .show(egui_ctx, egui_state.as_ref(), |ui| {
                         ui.label("Delay Time");
                         ui.add(
@@ -155,6 +174,12 @@ impl Plugin for DelayPlugin {
                         ui.label("Mix");
                         ui.add(
                             widgets::ParamSlider::for_param(&params.mix, setter)
+                                .with_width(ui.available_width())
+                        );
+
+                        ui.label("Cutoff");
+                        ui.add(
+                            widgets::ParamSlider::for_param(&params.cutoff, setter)
                                 .with_width(ui.available_width())
                         );
                     });
@@ -181,6 +206,7 @@ impl Plugin for DelayPlugin {
         // So max delay * sample rate is the total number of samples we need to store in the buffer.
         let max_delay_samples = (MAX_DELAY_TIME * self.sample_rate).ceil() as usize;
         self.delay_buffers = vec![vec![0.0; max_delay_samples + 1]; channel_count];
+        self.prev_output = vec![0.0; channel_count];
         true
     }
 
@@ -191,6 +217,7 @@ impl Plugin for DelayPlugin {
         for buf in &mut self.delay_buffers {
             buf.fill(0.0);
         }
+        self.prev_output.fill(0.0);
         self.write_index = 0;
     }
 
@@ -208,14 +235,19 @@ impl Plugin for DelayPlugin {
             let feedback = self.params.feedback.smoothed.next();
             let mix = self.params.mix.smoothed.next();
             let delay_samples = (delay_time * self.sample_rate) as usize; // compute number of delay samples
+            let a = (-2.0 * PI * self.params.cutoff.smoothed.next() / self.sample_rate).exp(); // cutoff frequency coefficient
             for (channel_idx, sample) in channel_samples.iter_mut().enumerate() {
                 let delay_buffer = &mut self.delay_buffers[channel_idx]; //get delay buffer
                 let read_index = (self.write_index + buf_len - delay_samples) % buf_len; // get the read index
                 let delayed = delay_buffer[read_index]; //get the delayed buffer sample
+                
+                let filtered = (1.0 - a) * delayed + a * self.prev_output[channel_idx]; // apply one-pole filter to delayed signal
+                self.prev_output[channel_idx] = filtered;
+                
                 let dry = *sample; // get the dry sample
-                delay_buffer[self.write_index] = dry + feedback * delayed; // write the delayed + feedbacked signal to buffer
+                delay_buffer[self.write_index] = dry + feedback * filtered; // write the delayed + feedbacked signal to buffer
 
-                *sample = (1.0 - mix) * dry + mix * delayed;
+                *sample = (1.0 - mix) * dry + mix * filtered;
             }
             self.write_index = (self.write_index + 1) % buf_len;
         }
