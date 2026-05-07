@@ -1,10 +1,9 @@
+mod editor;
+mod dsp;
+use dsp::delay_line::DelayLine;
+use dsp::filter::OnePoleLowPass;
 use nih_plug::prelude::*;
-use nih_plug_egui::{
-    create_egui_editor,
-    resizable_window::ResizableWindow,
-    widgets, EguiState,
-};
-use egui::Vec2;
+use nih_plug_egui::EguiState;
 use std::sync::Arc;
 use std::f32::consts::PI;
 
@@ -17,14 +16,13 @@ const MAX_DELAY_TIME: f32 = 2.0;
 
 pub struct DelayPlugin {
     params: Arc<DelayPluginParams>,
-    delay_buffers: Vec<Vec<f32>>, // one Vec per channel
-    write_index: usize,
+    delay_lines: Vec<DelayLine>,
     sample_rate: f32,
-    prev_output: Vec<f32>
+    filters: Vec<OnePoleLowPass>
 }
 
 #[derive(Params)]
-struct DelayPluginParams {
+pub(crate) struct DelayPluginParams {
     /// The parameter's ID is used to identify the parameter in the wrappred plugin API. As long as
     /// these IDs remain constant, you can rename and reorder these fields as you wish. The
     /// parameters are exposed to the host in the same order they were defined. In this case, this
@@ -46,10 +44,9 @@ impl Default for DelayPlugin {
     fn default() -> Self {
         Self {
             params: Arc::new(DelayPluginParams::default()),
-            delay_buffers: Vec::new(),
-            write_index: 0,
+            delay_lines: Vec::new(),
             sample_rate: 44100.0,
-            prev_output: Vec::new(),
+            filters: Vec::new(),
         }
     }
 }
@@ -146,45 +143,8 @@ impl Plugin for DelayPlugin {
         self.params.clone()
     }
 
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let params = self.params.clone();
-        let egui_state = params.egui_state.clone();
-        create_egui_editor(
-            self.params.egui_state.clone(), // egui state
-            (), // user state
-            Default::default(), // New Egui settings. Just use defaults
-            |_, _, _| {},                      // build closure (now takes 3 args)
-            move |egui_ctx, setter, _queue, _state| { // update closure now takes 4 args
-                //update closure
-                ResizableWindow::new("res-wind")
-                    .min_size(Vec2::new(300.0, 128.0))
-                    .show(egui_ctx, egui_state.as_ref(), |ui| {
-                        ui.label("Delay Time");
-                        ui.add(
-                            widgets::ParamSlider::for_param(&params.delay_time, setter)
-                                .with_width(ui.available_width())
-                        );
-
-                        ui.label("Feedback");
-                        ui.add(
-                            widgets::ParamSlider::for_param(&params.feedback, setter)
-                                .with_width(ui.available_width())
-                        );
-
-                        ui.label("Mix");
-                        ui.add(
-                            widgets::ParamSlider::for_param(&params.mix, setter)
-                                .with_width(ui.available_width())
-                        );
-
-                        ui.label("Cutoff");
-                        ui.add(
-                            widgets::ParamSlider::for_param(&params.cutoff, setter)
-                                .with_width(ui.available_width())
-                        );
-                    });
-            },
-        )
+    fn editor(&mut self, _: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        crate::editor::create(self.params.clone())
     }
 
     fn initialize(
@@ -205,8 +165,12 @@ impl Plugin for DelayPlugin {
         // max delay is 2 seconds, and sample rate is samples per second.
         // So max delay * sample rate is the total number of samples we need to store in the buffer.
         let max_delay_samples = (MAX_DELAY_TIME * self.sample_rate).ceil() as usize;
-        self.delay_buffers = vec![vec![0.0; max_delay_samples + 1]; channel_count];
-        self.prev_output = vec![0.0; channel_count];
+        self.delay_lines = (0..channel_count)
+            .map(|_| DelayLine::new(max_delay_samples))
+            .collect();
+        self.filters = (0..channel_count)
+            .map(|_| OnePoleLowPass::new())
+            .collect();
         true
     }
 
@@ -214,11 +178,12 @@ impl Plugin for DelayPlugin {
         // Reset delay buffers and write index to 0
         // remember to never allocate in the audio thread. This would be a heap
         // operation and can block the audio thread, causing glitches/pops.
-        for buf in &mut self.delay_buffers {
-            buf.fill(0.0);
+        for delay_line in &mut self.delay_lines {
+            delay_line.clear();
         }
-        self.prev_output.fill(0.0);
-        self.write_index = 0;
+        for filter in &mut self.filters {
+            filter.clear();
+        }
     }
 
     fn process(
@@ -227,29 +192,21 @@ impl Plugin for DelayPlugin {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let buf_len = self.delay_buffers[0].len(); // get the buffer length from initialization
-
-        for mut channel_samples in buffer.iter_samples() {
+        for mut frame in buffer.iter_samples() {
             // Read parameters with smoothing applied
             let delay_time = self.params.delay_time.smoothed.next();
             let feedback = self.params.feedback.smoothed.next();
             let mix = self.params.mix.smoothed.next();
             let delay_samples = (delay_time * self.sample_rate) as usize; // compute number of delay samples
             let a = (-2.0 * PI * self.params.cutoff.smoothed.next() / self.sample_rate).exp(); // cutoff frequency coefficient
-            for (channel_idx, sample) in channel_samples.iter_mut().enumerate() {
-                let delay_buffer = &mut self.delay_buffers[channel_idx]; //get delay buffer
-                let read_index = (self.write_index + buf_len - delay_samples) % buf_len; // get the read index
-                let delayed = delay_buffer[read_index]; //get the delayed buffer sample
-                
-                let filtered = (1.0 - a) * delayed + a * self.prev_output[channel_idx]; // apply one-pole filter to delayed signal
-                self.prev_output[channel_idx] = filtered;
-                
-                let dry = *sample; // get the dry sample
-                delay_buffer[self.write_index] = dry + feedback * filtered; // write the delayed + feedbacked signal to buffer
 
+            for (channel_idx, sample) in frame.iter_mut().enumerate() {
+                let dry = *sample; // get the dry sample
+                let delayed = self.delay_lines[channel_idx].read(delay_samples);
+                let filtered = self.filters[channel_idx].process(delayed, a); // apply one-pole filter to delayed signal
+                self.delay_lines[channel_idx].write(dry + feedback * filtered); //stores sample at write pos and advances write index
                 *sample = (1.0 - mix) * dry + mix * filtered;
             }
-            self.write_index = (self.write_index + 1) % buf_len;
         }
 
         ProcessStatus::Normal
